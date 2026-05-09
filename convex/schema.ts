@@ -942,7 +942,7 @@ const packageReleases = defineTable({
 
 const packageStatEvents = defineTable({
   packageId: v.id("packages"),
-  kind: v.literal("download"),
+  kind: v.union(v.literal("download"), v.literal("install")),
   occurredAt: v.number(),
   processedAt: v.optional(v.number()),
 }).index("by_unprocessed", ["processedAt"]);

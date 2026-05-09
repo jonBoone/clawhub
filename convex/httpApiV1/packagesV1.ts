@@ -86,6 +86,7 @@ const internalRefs = internal as unknown as {
     getReleaseByIdInternal: unknown;
     insertAuditLogInternal: unknown;
     recordPackageDownloadInternal: unknown;
+    recordPackageInstallInternal: unknown;
     requestRescanForApiTokenInternal: unknown;
     softDeletePackageInternal: unknown;
     moderatePackageReleaseForUserInternal: unknown;
@@ -500,6 +501,7 @@ async function streamClawPackRelease(
   rateHeaders: HeadersInit,
   pkg: PublicPackageDocLike,
   release: ReleaseLike,
+  statKind: "download" | "install" = "download",
 ) {
   const securityBlock = getReleaseSecurityBlock(release);
   if (securityBlock) return text(securityBlock.message, securityBlock.status, rateHeaders);
@@ -509,7 +511,11 @@ async function streamClawPackRelease(
   const blob = await ctx.storage.get(release.clawpackStorageId);
   if (!blob) return text("ClawPack artifact not found", 404, rateHeaders);
   try {
-    await runMutationRef(ctx, internalRefs.packages.recordPackageDownloadInternal, {
+    const statMutation =
+      statKind === "install"
+        ? internalRefs.packages.recordPackageInstallInternal
+        : internalRefs.packages.recordPackageDownloadInternal;
+    await runMutationRef(ctx, statMutation, {
       packageId: pkg._id,
     });
   } catch {
@@ -2714,7 +2720,7 @@ export async function npmMirrorGetHandler(ctx: ActionCtx, request: Request) {
     const tarballName = path.rest[1]!;
     const release = releases.find((candidate) => candidate.npmTarballName === tarballName);
     if (!release) return text("ClawPack artifact not found", 404, rate.headers);
-    return await streamClawPackRelease(ctx, rate.headers, detail.package, release);
+    return await streamClawPackRelease(ctx, rate.headers, detail.package, release, "install");
   }
   if (path.rest.length > 0) return text("Not found", 404, rate.headers);
 

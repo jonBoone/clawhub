@@ -1935,6 +1935,18 @@ export const recordPackageDownloadInternal = internalMutation({
   },
 });
 
+export const recordPackageInstallInternal = internalMutation({
+  args: { packageId: v.id("packages") },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("packageStatEvents", {
+      packageId: args.packageId,
+      kind: "install",
+      occurredAt: Date.now(),
+      processedAt: undefined,
+    });
+  },
+});
+
 export const processPackageStatEventsInternal = internalMutation({
   args: { batchSize: v.optional(v.number()) },
   handler: async (ctx, args) => {
@@ -1947,19 +1959,25 @@ export const processPackageStatEventsInternal = internalMutation({
 
     if (events.length === 0) return { processed: 0, packagesUpdated: 0 };
 
-    const downloadsByPackage = new Map<Id<"packages">, number>();
+    const statsByPackage = new Map<Id<"packages">, { downloads: number; installs: number }>();
     for (const event of events) {
-      downloadsByPackage.set(event.packageId, (downloadsByPackage.get(event.packageId) ?? 0) + 1);
+      const stats = statsByPackage.get(event.packageId) ?? { downloads: 0, installs: 0 };
+      if (event.kind === "install") {
+        stats.installs += 1;
+      } else {
+        stats.downloads += 1;
+      }
+      statsByPackage.set(event.packageId, stats);
     }
 
     let packagesUpdated = 0;
-    for (const [packageId, downloads] of downloadsByPackage) {
+    for (const [packageId, stats] of statsByPackage) {
       const pkg = await ctx.db.get(packageId);
       if (!pkg) continue;
       await ctx.db.patch(pkg._id, {
         stats: {
-          downloads: (pkg.stats?.downloads ?? 0) + downloads,
-          installs: pkg.stats?.installs ?? 0,
+          downloads: (pkg.stats?.downloads ?? 0) + stats.downloads,
+          installs: (pkg.stats?.installs ?? 0) + stats.installs,
           stars: pkg.stats?.stars ?? 0,
           versions: pkg.stats?.versions ?? 0,
         },

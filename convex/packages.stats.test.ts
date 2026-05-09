@@ -1,7 +1,11 @@
 /* @vitest-environment node */
 
 import { describe, expect, it, vi } from "vitest";
-import { processPackageStatEventsInternal, recordPackageDownloadInternal } from "./packages";
+import {
+  processPackageStatEventsInternal,
+  recordPackageDownloadInternal,
+  recordPackageInstallInternal,
+} from "./packages";
 
 type WrappedHandler<TArgs, TResult> = {
   _handler: (ctx: unknown, args: TArgs) => Promise<TResult>;
@@ -9,6 +13,10 @@ type WrappedHandler<TArgs, TResult> = {
 
 const recordDownloadHandler = (
   recordPackageDownloadInternal as unknown as WrappedHandler<{ packageId: string }, void>
+)._handler;
+
+const recordInstallHandler = (
+  recordPackageInstallInternal as unknown as WrappedHandler<{ packageId: string }, void>
 )._handler;
 
 const processStatsHandler = (
@@ -53,11 +61,45 @@ describe("package stat events", () => {
     );
   });
 
-  it("aggregates queued downloads before patching package stats", async () => {
+  it("records installs as append-only events", async () => {
+    const insert = vi.fn();
+
+    await recordInstallHandler(
+      {
+        db: {
+          query: vi.fn(),
+          get: vi.fn(),
+          normalizeId: vi.fn(),
+          insert,
+          patch: vi.fn(),
+          replace: vi.fn(),
+          delete: vi.fn(),
+          system: {
+            get: vi.fn(),
+            query: vi.fn(),
+          },
+        },
+      },
+      {
+        packageId: "packages:one",
+      },
+    );
+
+    expect(insert).toHaveBeenCalledWith(
+      "packageStatEvents",
+      expect.objectContaining({
+        packageId: "packages:one",
+        kind: "install",
+        processedAt: undefined,
+      }),
+    );
+  });
+
+  it("aggregates queued downloads and installs before patching package stats", async () => {
     const events = [
-      { _id: "packageStatEvents:1", packageId: "packages:one" },
-      { _id: "packageStatEvents:2", packageId: "packages:one" },
-      { _id: "packageStatEvents:3", packageId: "packages:two" },
+      { _id: "packageStatEvents:1", packageId: "packages:one", kind: "download" },
+      { _id: "packageStatEvents:2", packageId: "packages:one", kind: "install" },
+      { _id: "packageStatEvents:3", packageId: "packages:two", kind: "download" },
     ];
     const patch = vi.fn();
     const ctx = {
@@ -92,7 +134,13 @@ describe("package stat events", () => {
     expect(patch).toHaveBeenCalledWith(
       "packages:one",
       expect.objectContaining({
-        stats: expect.objectContaining({ downloads: 12 }),
+        stats: expect.objectContaining({ downloads: 11 }),
+      }),
+    );
+    expect(patch).toHaveBeenCalledWith(
+      "packages:one",
+      expect.objectContaining({
+        stats: expect.objectContaining({ installs: 2 }),
       }),
     );
     expect(patch).toHaveBeenCalledWith(
