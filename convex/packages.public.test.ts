@@ -2400,6 +2400,9 @@ describe("packages public queries", () => {
         updatedAt: expect.any(Number),
       }),
     );
+    const digestPatch = patch.mock.calls.find(([id]) => id === "packageSearchDigest:demo")?.[1];
+    expect(digestPatch).not.toHaveProperty("softDeletedBy");
+    expect(digestPatch).not.toHaveProperty("softDeletedByRole");
     expect(insert).toHaveBeenCalledWith(
       "auditLogs",
       expect.objectContaining({
@@ -2559,6 +2562,9 @@ describe("packages public queries", () => {
         updatedAt: expect.any(Number),
       }),
     );
+    const digestPatch = patch.mock.calls.find(([id]) => id === "packageSearchDigest:demo")?.[1];
+    expect(digestPatch).not.toHaveProperty("softDeletedBy");
+    expect(digestPatch).not.toHaveProperty("softDeletedByRole");
     expect(insert).toHaveBeenCalledWith(
       "auditLogs",
       expect.objectContaining({

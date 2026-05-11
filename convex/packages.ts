@@ -2170,17 +2170,15 @@ async function softDeletePackageDoc(
     deletedReleaseIds.push(release._id);
   }
 
-  const packagePatch = {
+  const packagePatch: Partial<Doc<"packages">> = {
     softDeletedAt: now,
     softDeletedBy: params.actorUserId,
     softDeletedByRole: params.actorRole ?? "user",
     updatedAt: now,
   };
+  const nextPackage: Doc<"packages"> = { ...pkg, ...packagePatch };
   await ctx.db.patch(pkg._id, packagePatch);
-  await upsertPackageSearchDigest(ctx, {
-    ...extractPackageDigestFields(pkg),
-    ...packagePatch,
-  });
+  await upsertPackageSearchDigest(ctx, extractPackageDigestFields(nextPackage));
   await ctx.db.insert("auditLogs", {
     actorUserId: params.actorUserId,
     action: "package.delete",
@@ -2348,11 +2346,9 @@ async function restorePackageDoc(
     scanStatus: nextLatest ? resolvePackageReleaseScanStatus(nextLatest) : undefined,
     updatedAt: now,
   };
+  const nextPackage: Doc<"packages"> = { ...pkg, ...packagePatch };
   await ctx.db.patch(pkg._id, packagePatch);
-  await upsertPackageSearchDigest(ctx, {
-    ...extractPackageDigestFields(pkg),
-    ...packagePatch,
-  });
+  await upsertPackageSearchDigest(ctx, extractPackageDigestFields(nextPackage));
   await ctx.db.insert("auditLogs", {
     actorUserId: params.actorUserId,
     action: "package.undelete",
