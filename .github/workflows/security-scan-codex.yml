@@ -52,5 +52,8 @@ jobs:
           fi
           codex --version
 
+      - name: Authenticate Codex CLI
+        run: printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key
+
       - name: Run Codex security worker
         run: bun scripts/security/run-codex-scan-worker.ts --limit "$CODEX_SECURITY_SCAN_LIMIT"

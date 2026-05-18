@@ -215,6 +215,7 @@ async function runCodex(job: ClaimedJob, workspace: string) {
     "--sandbox",
     "read-only",
     "--skip-git-repo-check",
+    "--ignore-user-config",
     "-c",
     "approval_policy=never",
     "-c",
