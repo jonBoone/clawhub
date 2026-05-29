@@ -1116,7 +1116,13 @@ async function storeClawPackFiles(
   ctx: ActionCtx,
   entries: Array<{ path: string; bytes: Uint8Array }>,
 ) {
-  return await Promise.all(entries.map((entry) => storeClawPackFile(ctx, entry)));
+  const files: Awaited<ReturnType<typeof storeClawPackFile>>[] = [];
+  // Convex HTTP actions have a tight memory ceiling; concurrent Blob/storage
+  // work can duplicate large npm-pack entries enough to OOM the action.
+  for (const entry of entries) {
+    files.push(await storeClawPackFile(ctx, entry));
+  }
+  return files;
 }
 
 async function parseMultipartPackagePublish(ctx: ActionCtx, request: Request) {
