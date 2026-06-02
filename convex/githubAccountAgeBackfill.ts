@@ -136,6 +136,39 @@ export const applyGitHubCreatedAtBackfillInternal = internalMutation({
   },
 });
 
+export const applyGitHubCreatedAtBackfillBatchInternal = internalMutation({
+  args: {
+    items: v.array(
+      v.object({
+        userId: v.id("users"),
+        githubCreatedAt: v.number(),
+      }),
+    ),
+    fetchedAt: v.number(),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: async (ctx, args) => {
+    let patched = 0;
+    let skipped = 0;
+    for (const item of args.items) {
+      const user = await ctx.db.get(item.userId);
+      if (!user || user.deletedAt || user.deactivatedAt || user.githubCreatedAt) {
+        skipped += 1;
+        continue;
+      }
+      if (!args.dryRun) {
+        await ctx.db.patch(item.userId, {
+          githubCreatedAt: item.githubCreatedAt,
+          githubFetchedAt: args.fetchedAt,
+          updatedAt: Date.now(),
+        });
+      }
+      patched += 1;
+    }
+    return { patched, skipped };
+  },
+});
+
 export const backfillGitHubCreatedAtInternal = internalAction({
   args: {
     cursor: v.optional(v.string()),
