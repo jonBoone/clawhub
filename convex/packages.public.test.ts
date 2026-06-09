@@ -8904,6 +8904,7 @@ describe("package scan backfill", () => {
         artifactKind: "plugin",
         artifactName: "demo-plugin",
         version: "2.0.0",
+        findingSummary: "ClawScan found malicious behavior.",
       }),
     );
   });
@@ -9037,6 +9038,7 @@ describe("package scan backfill", () => {
         artifactKind: "plugin",
         artifactName: "demo-plugin",
         version: "1.5.0",
+        findingSummary: "ClawScan found malicious behavior.",
       }),
     );
   });

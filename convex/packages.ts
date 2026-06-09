@@ -7053,6 +7053,7 @@ async function recordMaliciousPluginReleaseFinding(
     artifactName: pkg.normalizedName,
     version: release.version,
     trigger,
+    ...(release.llmAnalysis?.summary ? { findingSummary: release.llmAnalysis.summary } : {}),
     ...(release.sha256hash ? { sha256hash: release.sha256hash } : {}),
   });
 }
