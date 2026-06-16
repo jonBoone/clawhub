@@ -137,6 +137,7 @@ import { adjustUserSkillStatsForSkillChange } from "./lib/userSkillStats";
 import schema from "./schema";
 
 const MAX_OWNER_SUMMARY_LENGTH = 500;
+const MAX_POINTERLESS_VERSION_SURVIVOR_SCAN = 100;
 
 export { publishVersionForUser } from "./lib/skillPublish";
 
@@ -551,6 +552,33 @@ function isKnownMaliciousSkillVersion(
     sourceVersionId: version._id,
   });
   return patch.moderationVerdict === "malicious";
+}
+
+type SkillVersionOwnerDeleteAvailability = Pick<
+  Doc<"skillVersions">,
+  | "_id"
+  | "skillId"
+  | "softDeletedAt"
+  | "ownerDeletedAt"
+  | "staticScan"
+  | "vtAnalysis"
+  | "llmAnalysis"
+> & {
+  // Exact-version moderator revocation lands separately; stay compatible before its schema does.
+  manualRevocation?: unknown;
+};
+
+function isSkillVersionAvailableForOwnerDeleteSafety(
+  version: SkillVersionOwnerDeleteAvailability | null | undefined,
+  skillId: Id<"skills">,
+) {
+  return Boolean(
+    version &&
+    isPublicSkillVersionAvailableForSkill(version, skillId) &&
+    version.ownerDeletedAt === undefined &&
+    !version.manualRevocation &&
+    !isKnownMaliciousSkillVersion(version),
+  );
 }
 
 function compareSkillVersionsForRestore(
@@ -6559,18 +6587,24 @@ export const countPublicSkills = query({
 export const listVersions = query({
   args: { skillId: v.id("skills"), limit: v.optional(v.number()) },
   handler: async (ctx, args) => {
-    const limit = args.limit ?? 20;
+    const limit = clampInt(args.limit ?? 20, 1, MAX_PUBLIC_LIST_LIMIT);
     const authUserId = await getAuthUserId(ctx);
     const actor = authUserId ? await ctx.db.get(authUserId) : null;
     const isStaff = actor?.role === "admin" || actor?.role === "moderator";
-    const versions = await ctx.db
-      .query("skillVersions")
-      .withIndex("by_skill", (q) => q.eq("skillId", args.skillId))
-      .order("desc")
-      .take(limit);
-    return versions
-      .filter((version) => isStaff || !version.softDeletedAt)
-      .map((version) => toPublicSkillVersion(version)!);
+    const versions = isStaff
+      ? await ctx.db
+          .query("skillVersions")
+          .withIndex("by_skill", (q) => q.eq("skillId", args.skillId))
+          .order("desc")
+          .take(limit)
+      : await ctx.db
+          .query("skillVersions")
+          .withIndex("by_skill_active_created", (q) =>
+            q.eq("skillId", args.skillId).eq("softDeletedAt", undefined),
+          )
+          .order("desc")
+          .take(limit);
+    return versions.map((version) => toPublicSkillVersion(version)!);
   },
 });
 
@@ -6582,21 +6616,31 @@ export const listVersionsPage = query({
   },
   handler: async (ctx, args) => {
     const limit = clampInt(args.limit ?? 20, 1, MAX_LIST_LIMIT);
-    const { page, isDone, continueCursor } = await ctx.db
-      .query("skillVersions")
-      .withIndex("by_skill", (q) => q.eq("skillId", args.skillId))
-      .order("desc")
-      .paginate({ cursor: args.cursor ?? null, numItems: limit });
-    const items = page
-      .filter((version) => !version.softDeletedAt)
-      .map((version) => toPublicSkillVersion(version)!);
+    const runPaginate = (cursor: string | null) =>
+      ctx.db
+        .query("skillVersions")
+        .withIndex("by_skill_active_created", (q) =>
+          q.eq("skillId", args.skillId).eq("softDeletedAt", undefined),
+        )
+        .order("desc")
+        .paginate({ cursor, numItems: limit });
+    const { page, isDone, continueCursor } = await paginateWithStaleCursorRecovery(
+      runPaginate,
+      args.cursor ?? null,
+    );
+    const items = page.map((version) => toPublicSkillVersion(version)!);
     return { items, nextCursor: isDone ? null : continueCursor };
   },
 });
 
 export const getVersionById = query({
   args: { versionId: v.id("skillVersions") },
-  handler: async (ctx, args) => toPublicSkillVersion(await ctx.db.get(args.versionId)),
+  handler: async (ctx, args) => {
+    const version = await ctx.db.get(args.versionId);
+    return version && !version.softDeletedAt && version.ownerDeletedAt === undefined
+      ? toPublicSkillVersion(version)
+      : null;
+  },
 });
 
 export const getVersionsByIdsInternal = internalQuery({
@@ -8735,7 +8779,183 @@ export const getVersionBySkillAndVersion = query({
         q.eq("skillId", args.skillId).eq("version", args.version),
       )
       .unique();
-    return toPublicSkillVersion(version);
+    return version && !version.softDeletedAt && version.ownerDeletedAt === undefined
+      ? toPublicSkillVersion(version)
+      : null;
+  },
+});
+
+async function hasBoundedAvailableSkillVersionSurvivor(
+  ctx: MutationCtx,
+  skillId: Id<"skills">,
+  targetVersionId: Id<"skillVersions">,
+) {
+  const candidates = await ctx.db
+    .query("skillVersions")
+    .withIndex("by_skill_active_created", (q) =>
+      q.eq("skillId", skillId).eq("softDeletedAt", undefined),
+    )
+    .take(MAX_POINTERLESS_VERSION_SURVIVOR_SCAN + 1);
+  const hasSurvivor = candidates.some(
+    (candidate) =>
+      candidate._id !== targetVersionId &&
+      isSkillVersionAvailableForOwnerDeleteSafety(candidate, skillId),
+  );
+  if (hasSurvivor) return true;
+  if (candidates.length > MAX_POINTERLESS_VERSION_SURVIVOR_SCAN) {
+    throw new ConvexError(
+      "This skill has too many active versions to safely delete an individual version.",
+    );
+  }
+  return false;
+}
+
+async function hasAvailableLatestSkillVersionPointer(
+  ctx: MutationCtx,
+  skill: Pick<Doc<"skills">, "_id" | "latestVersionId" | "tags">,
+) {
+  const pointerIds = new Set<Id<"skillVersions">>();
+  if (skill.latestVersionId) pointerIds.add(skill.latestVersionId);
+  if (skill.tags.latest) pointerIds.add(skill.tags.latest);
+
+  for (const pointerId of pointerIds) {
+    const pointer = await ctx.db.get(pointerId);
+    if (isSkillVersionAvailableForOwnerDeleteSafety(pointer, skill._id)) return true;
+  }
+  return false;
+}
+
+export async function deleteOwnedSkillVersionForActor(
+  ctx: MutationCtx,
+  actor: Doc<"users">,
+  args: { versionId: Id<"skillVersions"> },
+) {
+  const version = await ctx.db.get(args.versionId);
+  if (!version) throw new ConvexError("Forbidden");
+
+  const skill = await ctx.db.get(version.skillId);
+  if (!skill) throw new ConvexError("Forbidden");
+
+  await assertCanManageOwnedResource(ctx, {
+    actor,
+    ownerUserId: skill.ownerUserId,
+    ownerPublisherId: skill.ownerPublisherId,
+    allowedPublisherRoles: ["admin"],
+  });
+
+  if (!isSkillVersionAvailableForOwnerDeleteSafety(version, skill._id)) {
+    throw new ConvexError("This skill version is already unavailable and cannot be deleted.");
+  }
+  if (skill.softDeletedAt || (skill.moderationStatus ?? "active") !== "active") {
+    throw new ConvexError("This skill is unavailable and its versions cannot be deleted.");
+  }
+
+  let mustPublishReplacement =
+    skill.latestVersionId === version._id ||
+    skill.tags.latest === version._id ||
+    skill.latestVersionSummary?.version === version.version;
+  if (!mustPublishReplacement && !(await hasAvailableLatestSkillVersionPointer(ctx, skill))) {
+    // Admin cleanup can clear latest pointers, so prove a survivor with a bounded indexed read.
+    mustPublishReplacement = !(await hasBoundedAvailableSkillVersionSurvivor(
+      ctx,
+      skill._id,
+      version._id,
+    ));
+  }
+  if (mustPublishReplacement) {
+    throw new ConvexError(
+      "Publish a replacement version before deleting the current latest version.",
+    );
+  }
+
+  const now = Date.now();
+  await ctx.db.patch(version._id, {
+    softDeletedAt: now,
+    ownerDeletedAt: now,
+    ownerDeletedBy: actor._id,
+  });
+
+  const nextTags = Object.fromEntries(
+    Object.entries(skill.tags ?? {}).filter(([, versionId]) => versionId !== version._id),
+  ) as Doc<"skills">["tags"];
+
+  if (Object.keys(nextTags).length !== Object.keys(skill.tags ?? {}).length) {
+    const skillPatch: Partial<Doc<"skills">> = {
+      tags: nextTags,
+      updatedAt: now,
+    };
+    await ctx.db.patch(skill._id, skillPatch);
+    await syncSkillSearchDigestForSkillDoc(ctx, { ...skill, ...skillPatch });
+  }
+
+  await ctx.db.insert("auditLogs", {
+    actorUserId: actor._id,
+    action: "skill.version.delete",
+    targetType: "skillVersion",
+    targetId: version._id,
+    metadata: {
+      skillId: skill._id,
+      slug: skill.slug,
+      version: version.version,
+    },
+    createdAt: now,
+  });
+
+  return { ok: true as const, skillId: skill._id, versionId: version._id };
+}
+
+export async function deleteOwnedSkillVersionForUser(
+  ctx: MutationCtx,
+  args: {
+    actorUserId: Id<"users">;
+    slug: string;
+    version: string;
+  },
+) {
+  const actor = await ctx.db.get(args.actorUserId);
+  if (!actor || actor.deletedAt || actor.deactivatedAt) throw new ConvexError("Unauthorized");
+
+  const slug = args.slug.trim();
+  if (!slug) throw new ConvexError("Slug required");
+  const version = args.version.trim();
+  if (!version) throw new ConvexError("Version required");
+
+  const resolved = await resolveSkillBySlugOrAlias(ctx, slug);
+  const skill = resolved.skill;
+  if (!skill) throw new ConvexError("Skill not found");
+
+  await assertCanManageOwnedResource(ctx, {
+    actor,
+    ownerUserId: skill.ownerUserId,
+    ownerPublisherId: skill.ownerPublisherId,
+    allowedPublisherRoles: ["admin"],
+  });
+
+  const skillVersion = await ctx.db
+    .query("skillVersions")
+    .withIndex("by_skill_version", (q) => q.eq("skillId", skill._id).eq("version", version))
+    .unique();
+  if (!skillVersion) throw new ConvexError("Skill version not found");
+
+  return await deleteOwnedSkillVersionForActor(ctx, actor, { versionId: skillVersion._id });
+}
+
+export const deleteOwnedVersionForUserInternal = internalMutation({
+  args: {
+    actorUserId: v.id("users"),
+    slug: v.string(),
+    version: v.string(),
+  },
+  handler: async (ctx, args) => {
+    return await deleteOwnedSkillVersionForUser(ctx, args);
+  },
+});
+
+export const deleteOwnedVersion = mutation({
+  args: { versionId: v.id("skillVersions") },
+  handler: async (ctx, args) => {
+    const { user } = await requireUser(ctx);
+    return await deleteOwnedSkillVersionForActor(ctx, user, args);
   },
 });
 

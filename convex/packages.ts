@@ -104,6 +104,8 @@ const MAX_PUBLIC_LIST_PAGE_SIZE = 200;
 const MAX_PLUGIN_EXPORT_LIST_LIMIT = 250;
 const MAX_SEARCH_PAGE_SIZE = 200;
 const MAX_DIRECT_PACKAGE_SEARCH_CANDIDATES = 20;
+const MAX_PACKAGE_VERSION_DELETE_LOOKUP_CANDIDATES = 4;
+const MAX_POINTERLESS_RELEASE_SURVIVOR_SCAN = 100;
 const MAX_APPEAL_MESSAGE_LENGTH = 2_000;
 const MAX_OFFICIAL_MIGRATION_BLOCKERS = 20;
 const MAX_OFFICIAL_MIGRATION_FIELD_LENGTH = 300;
@@ -2300,6 +2302,38 @@ export const getManageContext = query({
   },
 });
 
+export const canDeleteVersions = query({
+  args: {
+    name: v.string(),
+    candidateNames: v.optional(v.array(v.string())),
+  },
+  handler: async (ctx, args) => {
+    const viewerUserId = await getOptionalViewerUserId(ctx);
+    if (!viewerUserId) return false;
+
+    const candidates = [args.name, ...(args.candidateNames ?? [])]
+      .map((name) => normalizePackageName(name))
+      .filter(Boolean);
+    const uniqueCandidates = Array.from(new Set(candidates)).slice(
+      0,
+      MAX_PACKAGE_VERSION_DELETE_LOOKUP_CANDIDATES,
+    );
+
+    let pkg: Doc<"packages"> | null = null;
+    for (const candidate of uniqueCandidates) {
+      pkg = await getPackageByNormalizedName(ctx, candidate);
+      if (pkg && !pkg.softDeletedAt && pkg.family !== "skill") break;
+      pkg = null;
+    }
+    if (!pkg || isPackageBlockedFromPublic(pkg.scanStatus)) return false;
+
+    const actor = await ctx.db.get(viewerUserId);
+    if (!actor || actor.deletedAt || actor.deactivatedAt) return false;
+
+    return await viewerCanManagePackageOwner(ctx, pkg, viewerUserId);
+  },
+});
+
 function toPublicPackageInspectorFinding(warning: Doc<"packageInspectorWarnings">) {
   const findingKind =
     warning.findingKind ??
@@ -4193,6 +4227,7 @@ async function restorePackageDoc(
   const restoredReleaseIds: Array<Id<"packageReleases">> = [];
   const activeReleases: Doc<"packageReleases">[] = [];
   for (const release of releases) {
+    if (release.ownerDeletedAt !== undefined) continue;
     if (release.softDeletedAt) {
       if (
         params.releaseSoftDeletedAt !== undefined &&
@@ -4799,6 +4834,182 @@ export const softDeletePackage = mutation({
       actorRole: user.role,
       source: "dashboard",
     });
+  },
+});
+
+async function hasBoundedAvailablePackageReleaseSurvivor(
+  ctx: MutationCtx,
+  packageId: Id<"packages">,
+  targetReleaseId: Id<"packageReleases">,
+) {
+  const candidates = await ctx.db
+    .query("packageReleases")
+    .withIndex("by_package_active_created", (q) =>
+      q.eq("packageId", packageId).eq("softDeletedAt", undefined),
+    )
+    .take(MAX_POINTERLESS_RELEASE_SURVIVOR_SCAN + 1);
+  const hasSurvivor = candidates.some(
+    (candidate) =>
+      candidate._id !== targetReleaseId &&
+      isPackageReleaseAvailableForOwnerDeleteSafety(candidate, packageId),
+  );
+  if (hasSurvivor) return true;
+  if (candidates.length > MAX_POINTERLESS_RELEASE_SURVIVOR_SCAN) {
+    throw new ConvexError(
+      "This package has too many active releases to safely delete an individual release.",
+    );
+  }
+  return false;
+}
+
+function isPackageReleaseAvailableForOwnerDeleteSafety(
+  release: Doc<"packageReleases"> | null | undefined,
+  packageId: Id<"packages">,
+): release is Doc<"packageReleases"> {
+  return Boolean(
+    release &&
+    release.packageId === packageId &&
+    !release.softDeletedAt &&
+    release.ownerDeletedAt === undefined &&
+    resolvePackageReleaseScanStatus(release) !== "malicious",
+  );
+}
+
+async function hasAvailableLatestPackageReleasePointer(
+  ctx: MutationCtx,
+  pkg: Pick<Doc<"packages">, "_id" | "latestReleaseId" | "tags">,
+) {
+  const pointerIds = new Set<Id<"packageReleases">>();
+  if (pkg.latestReleaseId) pointerIds.add(pkg.latestReleaseId);
+  if (pkg.tags.latest) pointerIds.add(pkg.tags.latest);
+
+  for (const pointerId of pointerIds) {
+    const pointer = await ctx.db.get(pointerId);
+    if (isPackageReleaseAvailableForOwnerDeleteSafety(pointer, pkg._id)) return true;
+  }
+  return false;
+}
+
+export async function deleteOwnedPackageReleaseForActor(
+  ctx: MutationCtx,
+  actor: Doc<"users">,
+  args: { name: string; version: string },
+) {
+  const normalizedName = normalizePackageName(args.name);
+  const pkg = await getPackageByNormalizedName(ctx, normalizedName);
+  if (!pkg || pkg.softDeletedAt || isPackageBlockedFromPublic(pkg.scanStatus)) {
+    throw new ConvexError("This package is unavailable and its releases cannot be deleted.");
+  }
+  if (pkg.family === "skill") {
+    throw new ConvexError("Skill packages must use the skills deletion flow.");
+  }
+
+  await assertCanManageOwnedResource(ctx, {
+    actor,
+    ownerUserId: pkg.ownerUserId,
+    ownerPublisherId: pkg.ownerPublisherId,
+    allowedPublisherRoles: ["admin"],
+  });
+
+  const release = await ctx.db
+    .query("packageReleases")
+    .withIndex("by_package_version", (q) => q.eq("packageId", pkg._id).eq("version", args.version))
+    .unique();
+  if (!isPackageReleaseAvailableForOwnerDeleteSafety(release, pkg._id)) {
+    throw new ConvexError("This package release is already unavailable and cannot be deleted.");
+  }
+
+  let mustPublishReplacement =
+    pkg.latestReleaseId === release._id ||
+    pkg.tags.latest === release._id ||
+    pkg.latestVersionSummary?.version === release.version ||
+    release.distTags?.includes("latest") === true;
+  if (!mustPublishReplacement && !(await hasAvailableLatestPackageReleasePointer(ctx, pkg))) {
+    // Admin cleanup can clear latest pointers, so prove a survivor with a bounded indexed read.
+    mustPublishReplacement = !(await hasBoundedAvailablePackageReleaseSurvivor(
+      ctx,
+      pkg._id,
+      release._id,
+    ));
+  }
+  if (mustPublishReplacement) {
+    throw new ConvexError(
+      "Publish a replacement release before deleting the current latest release.",
+    );
+  }
+
+  const now = Date.now();
+  await ctx.db.patch(release._id, {
+    softDeletedAt: now,
+    ownerDeletedAt: now,
+    ownerDeletedBy: actor._id,
+  });
+
+  const nextTags = Object.fromEntries(
+    Object.entries(pkg.tags ?? {}).filter(([, releaseId]) => releaseId !== release._id),
+  ) as Doc<"packages">["tags"];
+  if (Object.keys(nextTags).length !== Object.keys(pkg.tags ?? {}).length) {
+    const packagePatch: Partial<Doc<"packages">> = {
+      tags: nextTags,
+      updatedAt: now,
+    };
+    const nextPackage: Doc<"packages"> = {
+      ...pkg,
+      ...packagePatch,
+    };
+    await ctx.db.patch(pkg._id, packagePatch);
+    const owner = await getOwnerPublisher(ctx, {
+      ownerPublisherId: pkg.ownerPublisherId,
+      ownerUserId: pkg.ownerUserId,
+    });
+    await upsertPackageSearchDigest(ctx, {
+      ...extractPackageDigestFields(nextPackage),
+      ownerHandle: owner?.handle ?? "",
+      ownerKind: owner?.kind,
+    });
+  }
+
+  await ctx.db.insert("auditLogs", {
+    actorUserId: actor._id,
+    action: "package.release.delete",
+    targetType: "packageRelease",
+    targetId: release._id,
+    metadata: {
+      packageId: pkg._id,
+      name: pkg.name,
+      version: release.version,
+    },
+    createdAt: now,
+  });
+
+  return { ok: true as const, packageId: pkg._id, releaseId: release._id };
+}
+
+export const deleteOwnedReleaseForUserInternal = internalMutation({
+  args: {
+    actorUserId: v.id("users"),
+    name: v.string(),
+    version: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const actor = await ctx.db.get(args.actorUserId);
+    if (!actor || actor.deletedAt || actor.deactivatedAt) throw new ConvexError("Unauthorized");
+
+    const version = args.version.trim();
+    if (!version) throw new ConvexError("Version required");
+
+    return await deleteOwnedPackageReleaseForActor(ctx, actor, {
+      name: args.name,
+      version,
+    });
+  },
+});
+
+export const deleteOwnedRelease = mutation({
+  args: { name: v.string(), version: v.string() },
+  handler: async (ctx, args) => {
+    const { user } = await requireUser(ctx);
+    return await deleteOwnedPackageReleaseForActor(ctx, user, args);
   },
 });
 

@@ -3336,6 +3336,37 @@ describe("httpApiV1 handlers", () => {
     expect(json.items[0].version).toBe("1.0.0");
   });
 
+  it("returns a recovered empty page for stale skill version cursors", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: { _id: "skills:1", slug: "demo", displayName: "Demo" },
+          latestVersion: null,
+          owner: { handle: "owner", displayName: "Owner", image: null },
+        };
+      }
+      if ("skillId" in args && "cursor" in args) {
+        return { items: [], nextCursor: null };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const response = await __handlers.skillsGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions?limit=1&cursor=legacy-cursor"),
+    );
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ items: [], nextCursor: null });
+    expect(runQuery).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        skillId: "skills:1",
+        limit: 1,
+        cursor: "legacy-cursor",
+      }),
+    );
+  });
+
   it("returns 404 for versions when the owner is banned", async () => {
     const runQuery = vi.fn(async () => null);
     const runMutation = vi.fn().mockResolvedValue(okRate());
@@ -6385,6 +6416,224 @@ describe("httpApiV1 handlers", () => {
     );
   });
 
+  it("deletes one skill version through the authenticated skill delete route", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: " 1.2.3 " }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(runMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        actorUserId: "users:1",
+        slug: "demo",
+        version: "1.2.3",
+      }),
+    );
+    const versionDeleteArgs = runMutation.mock.calls.find(
+      ([, args]) => typeof args === "object" && args !== null && "version" in args,
+    )?.[1];
+    expect(versionDeleteArgs).not.toHaveProperty("deleted");
+    expect(versionDeleteArgs).not.toHaveProperty("userId");
+  });
+
+  it("uses the skill version route when a redirect drops the request body", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const mutationArgs = runMutation.mock.calls.find(
+      ([, args]) => typeof args === "object" && args !== null && !("key" in args),
+    )?.[1];
+    expect(mutationArgs).toMatchObject({
+      actorUserId: "users:1",
+      slug: "demo",
+      version: "1.2.3",
+    });
+    expect(mutationArgs).not.toHaveProperty("deleted");
+  });
+
+  it("rejects conflicting skill version selectors across query, body, and path", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    for (const { bodyVersion, queryVersion } of [
+      { bodyVersion: "1.2.3", queryVersion: "9.9.9" },
+      { bodyVersion: "9.9.9", queryVersion: "1.2.3" },
+    ]) {
+      const response = await __handlers.skillsDeleteRouterV1Handler(
+        makeCtx({ runMutation }),
+        new Request(
+          `https://example.com/api/v1/skills/demo/versions/1.2.3?version=${queryVersion}`,
+          {
+            method: "DELETE",
+            headers: { Authorization: "Bearer clh_test" },
+            body: JSON.stringify({ version: bodyVersion }),
+          },
+        ),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("Version does not match request target");
+    }
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects a body-only skill version selector on the whole-skill route", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "1.2.3" }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("/versions/1.2.3");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects an empty skill version without deleting the whole skill", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "   " }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Version cannot be empty");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects a non-string skill version without deleting the whole skill", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: 123 }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Version must be a non-empty string");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects malformed skill version delete JSON", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: "{",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid JSON");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("preserves latest-version replacement guidance from skill version deletion", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const message = "Publish a replacement version before deleting the current latest version.";
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      throw new Error(`ConvexError: ${message}`);
+    });
+
+    const response = await __handlers.skillsDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/skills/demo/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "1.2.3" }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(message);
+  });
+
   it("skill rescan enqueues owner-authorized ClawScan jobs", async () => {
     vi.mocked(requireApiTokenUser).mockResolvedValue({
       userId: "users:moderator",
@@ -8916,6 +9165,52 @@ describe("httpApiV1 handlers", () => {
       expect.objectContaining({
         name: "private-plugin",
         viewerUserId: undefined,
+      }),
+    );
+  });
+
+  it("package skill compatibility versions return recovered empty pages for stale skill cursors", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("name" in args) {
+        return null;
+      }
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:demo",
+            slug: "demo",
+            displayName: "Demo Skill",
+            summary: "Skill summary",
+            latestVersionId: "skillVersions:demo-1",
+            tags: {},
+            badges: {},
+            createdAt: 1,
+            updatedAt: 2,
+          },
+          latestVersion: null,
+          owner: { handle: "owner" },
+        };
+      }
+      if ("skillId" in args && "cursor" in args) {
+        return { items: [], nextCursor: null };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+
+    const response = await __handlers.packagesGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation }),
+      new Request("https://example.com/api/v1/packages/demo/versions?limit=1&cursor=legacy-cursor"),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ items: [], nextCursor: null });
+    expect(runQuery).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        skillId: "skills:demo",
+        limit: 1,
+        cursor: "legacy-cursor",
       }),
     );
   });
@@ -12898,6 +13193,223 @@ describe("httpApiV1 handlers", () => {
         name: "@openclaw/demo-plugin",
       }),
     );
+  });
+
+  it("deletes one package version through the authenticated package delete route", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: " 1.2.3 " }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(runMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        actorUserId: "users:1",
+        name: "@openclaw/demo-plugin",
+        version: "1.2.3",
+      }),
+    );
+    const versionDeleteArgs = runMutation.mock.calls.find(
+      ([, args]) => typeof args === "object" && args !== null && "version" in args,
+    )?.[1];
+    expect(versionDeleteArgs).not.toHaveProperty("userId");
+  });
+
+  it("uses the package version route when a redirect drops the request body", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const mutationArgs = runMutation.mock.calls.find(
+      ([, args]) => typeof args === "object" && args !== null && !("key" in args),
+    )?.[1];
+    expect(mutationArgs).toMatchObject({
+      actorUserId: "users:1",
+      name: "@openclaw/demo-plugin",
+      version: "1.2.3",
+    });
+    expect(mutationArgs).not.toHaveProperty("userId");
+  });
+
+  it("rejects conflicting package version selectors across query, body, and path", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    for (const { bodyVersion, queryVersion } of [
+      { bodyVersion: "1.2.3", queryVersion: "9.9.9" },
+      { bodyVersion: "9.9.9", queryVersion: "1.2.3" },
+    ]) {
+      const response = await __handlers.packagesDeleteRouterV1Handler(
+        makeCtx({ runMutation }),
+        new Request(
+          `https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3?version=${queryVersion}`,
+          {
+            method: "DELETE",
+            headers: { Authorization: "Bearer clh_test" },
+            body: JSON.stringify({ version: bodyVersion }),
+          },
+        ),
+      );
+
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("Version does not match request target");
+    }
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects a body-only package version selector on the whole-package route", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "1.2.3" }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("/versions/1.2.3");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects an empty package version without deleting the whole package", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "   " }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Version cannot be empty");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects a non-string package version without deleting the whole package", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: 123 }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Version must be a non-empty string");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("rejects malformed package version delete JSON", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      return { ok: true };
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: "{",
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Invalid JSON");
+    expect(runMutation.mock.calls.filter(([, args]) => !("key" in args))).toHaveLength(0);
+  });
+
+  it("preserves latest-release replacement guidance from package version deletion", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValue({
+      userId: "users:1",
+      user: { _id: "users:1", handle: "p" },
+    } as never);
+    const message = "Publish a replacement release before deleting the current latest release.";
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if ("key" in args) return okRate();
+      throw new Error(message);
+    });
+
+    const response = await __handlers.packagesDeleteRouterV1Handler(
+      makeCtx({ runMutation }),
+      new Request("https://example.com/api/v1/packages/%40openclaw%2Fdemo-plugin/versions/1.2.3", {
+        method: "DELETE",
+        headers: { Authorization: "Bearer clh_test" },
+        body: JSON.stringify({ version: "1.2.3" }),
+      }),
+    );
+
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(message);
   });
 
   it("undeletes a package", async () => {

@@ -20,6 +20,7 @@ import {
   listPackageReportsInternal,
   getPackageModerationStatusForUserInternal,
   getManageContext,
+  canDeleteVersions,
   getPackageInspectorValidationSummaryPublic,
   listPackageInspectorWarningsForManager,
   listPackageInspectorFindingsPublic,
@@ -426,6 +427,12 @@ const getManageContextHandler = (
       package: { _id: string; name: string; displayName: string };
       latestRelease: { _id: string; version: string };
     } | null
+  >
+)._handler;
+const canDeleteVersionsHandler = (
+  canDeleteVersions as unknown as WrappedHandler<
+    { name: string; candidateNames?: string[] },
+    boolean
   >
 )._handler;
 const listPackageInspectorWarningsForManagerHandler = (
@@ -923,6 +930,118 @@ function makePackageDoc(overrides: Partial<Record<string, unknown>> = {}) {
     updatedAt: 1,
     softDeletedAt: undefined,
     ...overrides,
+  };
+}
+
+function makeCanDeleteVersionsCtx(options: {
+  viewerId: string;
+  viewerRole?: "user" | "admin" | "moderator";
+  ownerUserId: string;
+  ownerPublisherId?: string;
+  membershipRole?: "owner" | "admin" | "publisher";
+  packageLookupNames?: string[];
+  packageMatchName?: string | null;
+  packageOverrides?: Partial<Record<string, unknown>>;
+}) {
+  const pkg = makePackageDoc({
+    ownerUserId: options.ownerUserId,
+    ownerPublisherId: options.ownerPublisherId,
+    ...options.packageOverrides,
+  });
+  const publisher = options.ownerPublisherId
+    ? {
+        _id: options.ownerPublisherId,
+        kind: "org",
+        handle: "demo-org",
+        displayName: "Demo Org",
+      }
+    : null;
+
+  return {
+    db: {
+      get: vi.fn(async (id: string) => {
+        if (id === options.viewerId) {
+          return { _id: id, role: options.viewerRole ?? "user" };
+        }
+        if (id === options.ownerPublisherId) return publisher;
+        return null;
+      }),
+      query: vi.fn((table: string) => {
+        if (table === "users") {
+          return {
+            withIndex: vi.fn(() => ({
+              unique: vi.fn().mockResolvedValue(null),
+            })),
+          };
+        }
+        if (table === "packages") {
+          return {
+            withIndex: vi.fn(
+              (
+                _indexName: string,
+                builder?: (q: { eq: (field: string, value: string) => unknown }) => unknown,
+              ) => {
+                let normalizedName = "";
+                const queryBuilder = {
+                  eq: (field: string, value: string) => {
+                    if (field === "normalizedName") normalizedName = value;
+                    return queryBuilder;
+                  },
+                };
+                builder?.(queryBuilder);
+                options.packageLookupNames?.push(normalizedName);
+                return {
+                  unique: vi
+                    .fn()
+                    .mockResolvedValue(
+                      options.packageMatchName === undefined ||
+                        normalizedName === options.packageMatchName
+                        ? pkg
+                        : null,
+                    ),
+                };
+              },
+            ),
+          };
+        }
+        if (table === "publisherMembers") {
+          return {
+            withIndex: vi.fn(
+              (
+                _indexName: string,
+                builder?: (q: { eq: (field: string, value: string) => unknown }) => unknown,
+              ) => {
+                let publisherId = "";
+                let userId = "";
+                const queryBuilder = {
+                  eq: (field: string, value: string) => {
+                    if (field === "publisherId") publisherId = value;
+                    if (field === "userId") userId = value;
+                    return queryBuilder;
+                  },
+                };
+                builder?.(queryBuilder);
+                return {
+                  unique: vi.fn().mockResolvedValue(
+                    options.membershipRole &&
+                      publisherId === options.ownerPublisherId &&
+                      userId === options.viewerId
+                      ? {
+                          _id: "publisherMembers:viewer",
+                          publisherId,
+                          userId,
+                          role: options.membershipRole,
+                        }
+                      : null,
+                  ),
+                };
+              },
+            ),
+          };
+        }
+        throw new Error(`Unexpected table ${table}`);
+      }),
+    },
   };
 }
 
@@ -4280,6 +4399,57 @@ describe("packages public queries", () => {
     );
   });
 
+  it("does not restore owner-deleted releases with the whole package", async () => {
+    const { ctx, patch } = makeSoftDeletePackageCtx({
+      pkg: makePackageDoc({
+        softDeletedAt: 123,
+        softDeletedBy: "users:owner",
+        softDeletedByRole: "user",
+        latestReleaseId: undefined,
+        latestVersionSummary: undefined,
+        tags: {},
+      }),
+      releases: [
+        makeReleaseDoc({
+          _id: "packageReleases:ownerDeleted",
+          version: "2.0.0",
+          softDeletedAt: 100,
+          ownerDeletedAt: 100,
+          ownerDeletedBy: "users:owner",
+          distTags: ["latest"],
+          createdAt: 20,
+        }),
+        makeReleaseDoc({
+          _id: "packageReleases:restorable",
+          version: "1.0.0",
+          softDeletedAt: 123,
+          distTags: ["stable"],
+          createdAt: 10,
+        }),
+      ],
+    });
+
+    const result = await restorePackageInternalHandler(ctx, {
+      userId: "users:owner",
+      name: "demo-plugin",
+    });
+
+    expect(result).toMatchObject({ ok: true, releaseCount: 1, alreadyRestored: false });
+    expect(patch).not.toHaveBeenCalledWith("packageReleases:ownerDeleted", {
+      softDeletedAt: undefined,
+    });
+    expect(patch).toHaveBeenCalledWith("packageReleases:restorable", {
+      softDeletedAt: undefined,
+    });
+    expect(patch).toHaveBeenCalledWith(
+      "packages:demo",
+      expect.objectContaining({
+        latestReleaseId: "packageReleases:restorable",
+        latestVersionSummary: expect.objectContaining({ version: "1.0.0" }),
+      }),
+    );
+  });
+
   it("rejects owner restore for moderator-deleted packages", async () => {
     const { ctx, patch } = makeSoftDeletePackageCtx({
       pkg: makePackageDoc({
@@ -5856,12 +6026,15 @@ describe("packages public queries", () => {
     });
   });
 
-  it("rejects duplicate package versions by default", async () => {
+  it("rejects an owner-deleted package version even when matching workflow retries are allowed", async () => {
     const ctx = makeInsertReleaseCtx(makePackageDoc(), [
       makeReleaseDoc({
         _id: "packageReleases:existing",
         version: "1.0.0",
         integritySha256: "abc123",
+        softDeletedAt: 123,
+        ownerDeletedAt: 123,
+        ownerDeletedBy: "users:owner",
       }),
     ]);
 
@@ -5878,6 +6051,7 @@ describe("packages public queries", () => {
         summary: "demo",
         files: [],
         integritySha256: "abc123",
+        allowExistingRelease: true,
       }),
     ).rejects.toThrow("Version 1.0.0 already exists. Increment the version number and try again.");
   });
@@ -9524,6 +9698,125 @@ describe("packages public queries", () => {
     );
 
     expect(result).toBeNull();
+  });
+
+  it("allows direct package owners to delete versions", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:owner" as never);
+
+    const result = await canDeleteVersionsHandler(
+      makeCanDeleteVersionsCtx({
+        viewerId: "users:owner",
+        ownerUserId: "users:owner",
+      }) as never,
+      { name: "demo-plugin" },
+    );
+
+    expect(result).toBe(true);
+  });
+
+  it("does not let package owners delete versions when the package is blocked from public use", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:owner" as never);
+
+    const result = await canDeleteVersionsHandler(
+      makeCanDeleteVersionsCtx({
+        viewerId: "users:owner",
+        ownerUserId: "users:owner",
+        packageOverrides: { scanStatus: "malicious" },
+      }) as never,
+      { name: "demo-plugin" },
+    );
+
+    expect(result).toBe(false);
+  });
+
+  it.each(["owner", "admin"] as const)(
+    "allows org %s members to delete versions",
+    async (membershipRole) => {
+      vi.mocked(getAuthUserId).mockResolvedValue("users:org-manager" as never);
+
+      const result = await canDeleteVersionsHandler(
+        makeCanDeleteVersionsCtx({
+          viewerId: "users:org-manager",
+          ownerUserId: "users:creator",
+          ownerPublisherId: "publishers:demo-org",
+          membershipRole,
+        }) as never,
+        { name: "demo-plugin" },
+      );
+
+      expect(result).toBe(true);
+    },
+  );
+
+  it.each([
+    { label: "ordinary org publisher", membershipRole: "publisher" as const },
+    { label: "non-member", membershipRole: undefined },
+  ])("does not let $label delete versions", async ({ membershipRole }) => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:org-viewer" as never);
+
+    const result = await canDeleteVersionsHandler(
+      makeCanDeleteVersionsCtx({
+        viewerId: "users:org-viewer",
+        ownerUserId: "users:creator",
+        ownerPublisherId: "publishers:demo-org",
+        membershipRole,
+      }) as never,
+      { name: "demo-plugin" },
+    );
+
+    expect(result).toBe(false);
+  });
+
+  it.each(["admin", "moderator"] as const)(
+    "does not let platform %s staff delete versions without ownership",
+    async (viewerRole) => {
+      vi.mocked(getAuthUserId).mockResolvedValue("users:staff" as never);
+
+      const result = await canDeleteVersionsHandler(
+        makeCanDeleteVersionsCtx({
+          viewerId: "users:staff",
+          viewerRole,
+          ownerUserId: "users:owner",
+        }) as never,
+        { name: "demo-plugin" },
+      );
+
+      expect(result).toBe(false);
+    },
+  );
+
+  it("bounds normalized unique candidate lookups when checking version delete capability", async () => {
+    vi.mocked(getAuthUserId).mockResolvedValue("users:owner" as never);
+    const packageLookupNames: string[] = [];
+
+    const result = await canDeleteVersionsHandler(
+      makeCanDeleteVersionsCtx({
+        viewerId: "users:owner",
+        ownerUserId: "users:owner",
+        packageLookupNames,
+        packageMatchName: null,
+      }) as never,
+      {
+        name: " primary-plugin ",
+        candidateNames: [
+          "PRIMARY-PLUGIN",
+          "candidate-one",
+          "candidate-two",
+          "candidate-three",
+          "candidate-four",
+          "candidate-five",
+          "candidate-one",
+        ],
+      },
+    );
+
+    expect(result).toBe(false);
+    expect(packageLookupNames).toEqual([
+      "primary-plugin",
+      "candidate-one",
+      "candidate-two",
+      "candidate-three",
+    ]);
   });
 
   it("returns only slim package identifiers for package manage context", async () => {
