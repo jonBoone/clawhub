@@ -62,7 +62,7 @@ export type PublishVersionArgs = {
   version: string;
   changelog: string;
   tags?: string[];
-  forkOf?: { slug: string; version?: string };
+  forkOf?: { slug: string; ownerHandle?: string; version?: string };
   source?: {
     kind: "github";
     url: string;
@@ -88,6 +88,7 @@ export type PublishOptions = {
   skipBackup?: boolean;
   skipWebhook?: boolean;
   ownerPublisherId?: Id<"publishers">;
+  sourceOwnerPublisherId?: Id<"publishers">;
   sourceProvenance?: PublishVersionArgs["source"];
   // Explicit opt-in to owner migration. The `insertVersion` mutation refuses
   // to rewrite a skill's `ownerPublisherId` unless this is `true`, so default
@@ -120,8 +121,12 @@ export async function publishVersionForUser(
   if (!options.bypassGitHubAccountAge) {
     await requireGitHubAccountAge(ctx, userId);
   }
-  const existingSkill = (await ctx.runQuery(internal.skills.getSkillBySlugInternal, {
+  const existingSkill = (await ctx.runQuery(internal.skills.getSkillForPublishPreflightInternal, {
+    userId,
     slug: normalizedSlug,
+    ownerPublisherId: options.ownerPublisherId,
+    sourceOwnerPublisherId: options.sourceOwnerPublisherId,
+    migrateOwner: options.migrateOwner,
   })) as Doc<"skills"> | null;
   const isNewSkill = !existingSkill;
   const publishedVersionIsLatest = shouldPublishVersionBecomeLatest(
@@ -298,6 +303,7 @@ export async function publishVersionForUser(
   const publishResult = (await ctx.runMutation(internal.skills.insertVersion, {
     userId,
     ownerPublisherId: options.ownerPublisherId,
+    sourceOwnerPublisherId: options.sourceOwnerPublisherId,
     migrateOwner: options.migrateOwner,
     slug,
     displayName,
@@ -311,6 +317,7 @@ export async function publishVersionForUser(
     forkOf: args.forkOf
       ? {
           slug: args.forkOf.slug.trim().toLowerCase(),
+          ownerHandle: args.forkOf.ownerHandle?.trim().replace(/^@+/, "") || undefined,
           version: args.forkOf.version?.trim() || undefined,
         }
       : undefined,
@@ -392,6 +399,7 @@ export async function publishVersionForUser(
       slug,
       version,
       displayName,
+      ownerHandle,
     });
   }
 
@@ -579,10 +587,11 @@ function formatEmbeddingError(error: unknown) {
 
 async function schedulePublishWebhook(
   ctx: ActionCtx,
-  params: { slug: string; version: string; displayName: string },
+  params: { slug: string; version: string; displayName: string; ownerHandle?: string },
 ) {
   const result = (await ctx.runQuery(api.skills.getBySlug, {
     slug: params.slug,
+    ownerHandle: params.ownerHandle,
   })) as { skill: Doc<"skills">; owner: PublicUser | null } | null;
   if (!result?.skill) return;
 

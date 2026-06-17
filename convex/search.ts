@@ -82,6 +82,7 @@ const MAX_DIRECT_SKILL_SEARCH_CANDIDATES = 100;
 const MAX_DIRECT_SKILL_FULL_TEXT_CANDIDATES = 40;
 const MIN_VECTOR_SEARCH_CANDIDATES = 50;
 const MAX_VECTOR_SEARCH_CANDIDATES = 128;
+const MAX_EXACT_SLUG_MATCHES = 25;
 const EXPLORATORY_SEARCH_MIN_TOKEN_LENGTH = 3;
 
 function getNextCandidateLimit(current: number, max: number) {
@@ -219,16 +220,19 @@ export const searchSkills: ReturnType<typeof action> = action({
     if (!query) return [];
     const queryTokens = tokenize(query);
     if (queryTokens.length === 0) return [];
-    const rawExactSlugMatch = isSlugLikeQuery(query)
+    const rawExactSlugMatches = isSlugLikeQuery(query)
       ? ((await ctx.runQuery(internal.search.getExactSkillSlugMatch, {
           slug: query.toLowerCase(),
           nonSuspiciousOnly: args.nonSuspiciousOnly,
-        })) as SkillSearchEntry | null)
-      : null;
-    const exactSlugMatch =
-      rawExactSlugMatch && (!args.highlightedOnly || isSkillHighlighted(rawExactSlugMatch.skill))
-        ? rawExactSlugMatch
-        : null;
+        })) as SkillSearchEntry[] | SkillSearchEntry | null)
+      : [];
+    const exactSlugMatches = (
+      Array.isArray(rawExactSlugMatches)
+        ? rawExactSlugMatches
+        : rawExactSlugMatches
+          ? [rawExactSlugMatches]
+          : []
+    ).filter((entry) => !args.highlightedOnly || isSkillHighlighted(entry.skill));
     const directPrefixMatches = (await ctx.runQuery(internal.search.directPrefixSkillMatches, {
       query,
       highlightedOnly: args.highlightedOnly,
@@ -314,9 +318,10 @@ export const searchSkills: ReturnType<typeof action> = action({
       }
     }
 
-    const directMatches = exactSlugMatch
-      ? mergeUniqueBySkillId([exactSlugMatch], directPrefixMatches)
-      : directPrefixMatches;
+    const directMatches =
+      exactSlugMatches.length > 0
+        ? mergeUniqueBySkillId(exactSlugMatches, directPrefixMatches)
+        : directPrefixMatches;
     const primaryMatches = mergeUniqueBySkillId(directMatches, exactMatches);
 
     const fallbackMatches =
@@ -375,25 +380,33 @@ export const getExactSkillSlugMatch = internalQuery({
     slug: v.string(),
     nonSuspiciousOnly: v.optional(v.boolean()),
   },
-  handler: async (ctx, args): Promise<SkillSearchEntry | null> => {
-    const skill = await ctx.db
+  handler: async (ctx, args): Promise<SkillSearchEntry[]> => {
+    const skills = await ctx.db
       .query("skills")
       .withIndex("by_slug", (q) => q.eq("slug", args.slug))
-      .unique();
-    if (!skill || skill.softDeletedAt) return null;
-    if (args.nonSuspiciousOnly && isSkillSuspicious(skill)) return null;
-
+      .take(MAX_EXACT_SLUG_MATCHES);
     const getOwnerInfo = makeOwnerInfoGetter(ctx);
-    const resolved = await getOwnerInfo(skill.ownerUserId, skill.ownerPublisherId);
-    const publicSkill = toPublicSkill(skill);
-    if (!publicSkill || !resolved.owner) return null;
 
-    return {
-      skill: publicSkill,
-      version: null,
-      ownerHandle: resolved.ownerHandle,
-      owner: resolved.owner,
-    };
+    const entries = await Promise.all(
+      skills.map(async (skill) => {
+        if (skill.softDeletedAt) return null;
+        if (args.nonSuspiciousOnly && isSkillSuspicious(skill)) return null;
+
+        const resolved = await getOwnerInfo(skill.ownerUserId, skill.ownerPublisherId);
+        const publicSkill = toPublicSkill(skill);
+        if (!publicSkill || !resolved.owner) return null;
+
+        const entry: SkillSearchEntry = {
+          skill: publicSkill,
+          version: null as Doc<"skillVersions"> | null,
+          ownerHandle: resolved.ownerHandle,
+          owner: resolved.owner,
+        };
+        return entry;
+      }),
+    );
+
+    return entries.filter((entry): entry is SkillSearchEntry => entry !== null);
   },
 });
 
@@ -660,23 +673,25 @@ export const lexicalFallbackSkills = internalQuery({
       { ownerHandle: string | null; owner: PublicPublisher | null }
     >();
 
-    // Exact slug match via the skills table (only one row, cheap).
+    // Exact slug matches via the skills table. Slugs are unique per publisher,
+    // so this read must tolerate multiple rows for the same global slug.
     // Use the lenient shape predicate so legacy rows with sub-min-length
     // slugs stay discoverable; the caller in searchSkills already passes
     // skipExactSlugLookup=true after running its own exact-slug lookup.
     const slugQuery = normalizeSkillSlug(args.query);
     if (!args.skipExactSlugLookup && isSearchableSkillSlugShape(slugQuery)) {
-      const exactSlugSkill = await ctx.db
+      const exactSlugSkills = await ctx.db
         .query("skills")
         .withIndex("by_slug", (q) => q.eq("slug", slugQuery))
-        .unique();
-      if (
-        exactSlugSkill &&
-        !exactSlugSkill.softDeletedAt &&
-        (!args.nonSuspiciousOnly || !isSkillSuspicious(exactSlugSkill))
-      ) {
-        seenSkillIds.add(exactSlugSkill._id);
-        candidates.push(exactSlugSkill);
+        .take(MAX_EXACT_SLUG_MATCHES);
+      for (const exactSlugSkill of exactSlugSkills) {
+        if (
+          !exactSlugSkill.softDeletedAt &&
+          (!args.nonSuspiciousOnly || !isSkillSuspicious(exactSlugSkill))
+        ) {
+          seenSkillIds.add(exactSlugSkill._id);
+          candidates.push(exactSlugSkill);
+        }
       }
     }
 

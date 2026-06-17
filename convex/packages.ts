@@ -6093,12 +6093,6 @@ async function publishPackageImpl(
   }
   const legacyZipSha256 = await sha256Hex(buildDeterministicPackageZip(legacyZipEntries));
 
-  const existingSkill = await runQueryRef(ctx, internalRefs.skills.getSkillBySlugInternal, {
-    slug: name,
-  });
-  if (existingSkill) {
-    throw new ConvexError(`Package name collides with existing skill slug "${name}"`);
-  }
   if (family === "code-plugin" && (!effectiveSource?.repo || !effectiveSource?.commit)) {
     throw new ConvexError("Code plugins require source repo and commit metadata");
   }

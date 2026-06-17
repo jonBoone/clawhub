@@ -89,7 +89,20 @@ export function Upload() {
   const generateUploadUrl = useMutation(api.uploads.generateUploadUrl);
   const publishVersion = useAction(api.skills.publishVersion);
   const generateChangelogPreview = useAction(api.skills.generateChangelogPreview);
-  const existing = useQuery(api.skills.getBySlug, updateSlug ? { slug: updateSlug } : "skip");
+  const existingSkill = useQuery(
+    api.skills.getBySlug,
+    updateSlug ? { slug: updateSlug, ownerHandle: searchOwnerHandle || undefined } : "skip",
+  );
+  const existing = existingSkill as
+    | {
+        skill?: { slug: string; displayName: string; icon?: string | null };
+        latestVersion?: { version: string };
+        // Used to default the Owner selector to the skill's current owner in
+        // update mode so a New Version publish does not silently re-own it.
+        owner?: { handle: string; displayName?: string };
+      }
+    | null
+    | undefined;
 
   const [hasAttempted, setHasAttempted] = useState(false);
   const [files, setFiles] = useState<File[]>([]);
@@ -679,6 +692,10 @@ export function Upload() {
       }
       const result = await publishVersion({
         ownerHandle: ownerHandle || undefined,
+        sourceOwnerHandle:
+          isOwnerMigration && confirmMigrateOwner && existingOwnerHandle
+            ? existingOwnerHandle
+            : undefined,
         // Only propagate the migration opt-in when the user is actually
         // changing the skill's owner AND has explicitly confirmed the move.
         // Same-owner republishes must never carry `migrateOwner: true`.
