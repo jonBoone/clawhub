@@ -374,6 +374,16 @@ export function normalizeInferredCatalogTopics(
   }
 }
 
+export function resolveCatalogTopics(input: {
+  declared?: readonly string[] | null;
+  inferred?: readonly string[] | null;
+  inferenceCurrent?: boolean;
+}): string[] {
+  if (input.declared !== undefined) return input.declared ? [...input.declared] : [];
+  if (!input.inferenceCurrent) return [];
+  return normalizeInferredCatalogTopics(input.inferred);
+}
+
 export function getCatalogTopicSlugs(values: readonly string[] | null | undefined): string[] {
   const slugs: string[] = [];
   const seenSlugs = new Set<string>();
@@ -395,6 +405,9 @@ export function getCatalogTopicSlugs(values: readonly string[] | null | undefine
 
 type SkillCategoryCandidate = {
   categories?: readonly string[] | null;
+  inferredCategories?: readonly string[] | null;
+  latestVersionId?: string | null;
+  inferredFromVersionId?: string | null;
   slug: string;
   displayName: string;
   summary?: string | null;
@@ -408,5 +421,10 @@ export function resolveStoredSkillCategories(skill: SkillCategoryCandidate): Ski
   } catch {
     declared = undefined;
   }
-  return resolveSkillCategories({ declared });
+  const inferenceCurrent =
+    Boolean(skill.latestVersionId) && skill.latestVersionId === skill.inferredFromVersionId;
+  return resolveSkillCategories({
+    declared,
+    inferred: inferenceCurrent ? skill.inferredCategories : undefined,
+  });
 }
